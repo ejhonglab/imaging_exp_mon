@@ -14,17 +14,60 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import numpy as np
 import h5py
+import matplotlib.pyplot as plt
 
 
-def read_presentation_frames(xy, z=None, c=None):
-    """
+# The number of seconds the scope is aqcuiring for each odor presentation.
+# Only support fixed length here.
+presentation_seconds = 60.0
+# TODO check this
+seconds_before_odor = 5.0
+
+
+def read_presentation_frames(imaging_file, n_frames, xy, z=None, c=None,
+    presentation_num=None):
+    """Returns (t,x,y) indexed timeseries.
+
     xy (array-like): number of pixels along X and Y dimensions
     z (int): number of pixels along Z dimension
     c (int): number of channels
+    presentation_num (int): non-negative integer or None. If None, will load
+        frames from last presentation.
     """
-    # TODO prob need to know how long each presentation is beyond thorimage
-    # info...
-    raise NotImplementedError
+    # TODO err if presentation_num would run us off the end
+
+    # (16-bit)
+    bytes_per_pixel = 2
+    
+    if z is not None or c is not None:
+        raise NotImplementedError
+
+    x, y = xy
+    # TODO off by one?
+    offset = (-1) * (bytes_per_pixel * x * y * n_frames)
+
+    # 0 = beginning, 1 = current position, 2 = end
+    # Goal is to load the frames from the LAST presentation.
+    if presentation_num is None:
+        from_what = 2
+    else:
+        offset = (-1) * presentation_num * offset
+        from_what = 0
+
+    # From ThorImage manual: "unsigned, 16-bit, with little-endian byte-order"
+    dtype = np.dtype('<u2')
+
+    with open(imaging_file, 'rb') as f:
+        # TODO TODO actually, how to specify end of where fromfile should load
+        # from if that isn't the end of the file?
+        # (for offline analysis w/ hardcoded presentation_num)
+        # (or just load all frames in that case?)
+        f.seek(offset, from_what)
+        # TODO maybe check we actually get enough bytes for n_frames?
+        data = np.fromfile(f, dtype=dtype)
+
+    data = np.reshape(data, (n_frames, x, y))
+    return data
 
 
 def read_presentation_syncdata():
@@ -49,22 +92,173 @@ def read_presentation_syncdata():
 def xml_root(xml_path):
     """
     """
-    # TODO reason not to getroot?
     return etree.parse(xml_path).getroot()
 
 
+def get_thorimage_dims(xmlroot):
+    """
+    """
+    lsm_attribs = xmlroot.find('LSM').attrib
+    x = int(lsm_attribs['pixelX'])
+    y = int(lsm_attribs['pixelY'])
+    xy = (x,y)
+
+    # TODO make this None unless z-stepping seems to be enabled
+    # + check this variable actually indicates output steps
+    #int(xml.find('ZStage').attrib['steps'])
+    z = None
+    c = None
+
+    return xy, z, c
+
+
+def get_thorimage_fps(xmlroot):
+    """
+    """
+    lsm_attribs = xmlroot.find('LSM').attrib
+    raw_fps = float(lsm_attribs['frameRate'])
+    # TODO what does averageMode = 1 mean? always like that?
+    # 
+    n_averaged_frames = int(lsm_attribs['averageNum'])
+    saved_fps = raw_fps / n_averaged_frames
+    return saved_fps
+
+
+def mean_response(baseline, frames):
+    """
+    """
+    response_seconds = 2.0
+    n_response_frames = int(np.round(response_seconds * fps))
+
+    # TODO check this doesn't overlap by a frame w/ baseline
+    response_frames = frames[:(frames_before_odor + n_response_frames),:,:]
+
+    # TODO equivalent to taking mean in response period first and diffing?
+    response = (response_frames - baseline) / baseline
+    mean_df_over_f = np.mean(response)
+
+    return mean_df_over_f
+
+
+def load_thorimage_metadata(directory):
+    """
+    """
+    # TODO does xml get written immediately?
+    xml_path = join(directory, 'Experiment.xml')
+    xml = xml_root(xml_path)
+
+    fps = get_thorimage_fps(xml)
+    xy, z, c = get_thorimage_dims(xml)
+    imaging_file = join(directory, 'Image_0001_0001.raw')
+
+    return fps, xy, z, c, imaging_file
+
+
+def analyze_thorimage_offline(directory):
+    """
+    """
+    # TODO try to share more code w/ monitor_... !
+
+    fps, xy, z, c, imaging_file = load_thorimage_metadata(directory)
+    n_presentation_frames = int(np.round(fps * presentation_seconds))
+
+    first_baseline = None
+    # Responses
+    mean_responses = []
+    # Baseline drift
+    mean_bn_over_b0 = []
+
+    #mean_movement = []
+
+    # TODO guess presentation num from other params / say if raw
+    # doesnt have an integer number of frames assuming all hardcoded params
+    # (presentation seconds especially)
+    n_presentations = 3
+
+    for n in range(n_presentations):
+        frames = read_presentation_frames(imaging_file, n_presentation_frames,
+                                          xy, presentation_num=n)
+
+        # Compute baseline
+        frames_before_odor = int(np.round(seconds_before_odor * fps))
+        baseline = np.mean(frames[:frames_before_odor,:,:], axis=0)
+
+        if first_baseline is None:
+            first_baseline = baseline
+
+        baseline_drift = np.mean(baseline / first_baseline)
+        mean_bn_over_b0.append(baseline_drift)
+
+        # Check response
+        mean_df_over_f = mean_response(baseline,
+                                       frames[frames_before_odor:,:,:])
+
+        mean_responses.append(mean_df_over_f)
+
+        print('Mean (baseline / first baseline): {}'.format(baseline_drift))
+
+        print('Mean dF/F in {} seconds after odor: {}'.format(response_seconds,
+            mean_df_over_f))
+
+
+# TODO TODO include global knowledge of odor order, so that all monitor
+# functions can save odor specific statistics over time, so that outliers can be
+# detected
 def monitor_thorimage(directory):
     """
     """
-    # TODO get xy, z, c from xml
-    # (it gets written to all immediately, right?)
-    xml_path = join(directory, 'Experiment.xml')
-    xml = xml_root()
-
-    # TODO evaluate calcium responses
-    # TODO evaluate baseline drift
-    # TODO evaluate movement
+    # TODO TODO how to know when to terminate this program?
+    # intercept Thor IPC? wait for a file to finish writing?
+    # does Experiment.xml actually have experiment status updated to stopped at
+    # end (what about crash cases though...)?
     print('monitor_thorimage on', directory)
+
+    fps, xy, z, c, imaging_file = load_thorimage_metadata(directory)
+
+    first_baseline = None
+    # Responses
+    mean_responses = []
+    # Baseline drift
+    mean_bn_over_b0 = []
+
+    #mean_movement = []
+
+
+    # TODO TODO and how to know when to iterate?
+    # watch raw file for writes (is it written all at end of block?)
+
+    n_presentation_frames = int(np.round(fps * presentation_seconds))
+
+    ############ Iterate the rest of the fn ###########
+    frames = read_presentation_frames(imaging_file, n_presentation_frames, xy)
+
+    # Compute baseline
+    frames_before_odor = int(np.round(seconds_before_odor * fps))
+    baseline = np.mean(frames[:frames_before_odor,:,:], axis=0)
+
+    if first_baseline is None:
+        first_baseline = baseline
+
+    # TODO maybe compute this wrt just the previous presentation?
+    baseline_drift = np.mean(baseline / first_baseline)
+    mean_bn_over_b0.append(baseline_drift)
+
+    # Check response
+    mean_df_over_f = mean_response(baseline, frames[frames_before_odor:,:,:])
+    mean_responses.append(mean_df_over_f)
+
+    # TODO find some appropriate threshold for quality here
+    # (doable?)
+
+    # TODO evaluate return to baseline?
+    # TODO evaluate movement
+
+    print('Mean (baseline / first baseline): {}'.format(baseline_drift))
+
+    print('Mean dF/F in {} seconds after odor: {}'.format(response_seconds,
+        mean_df_over_f))
+    import ipdb; ipdb.set_trace()
+
 
 
 def monitor_thorsync(directory):
@@ -125,7 +319,8 @@ def is_thorimage_dir(d):
     # TODO any of preview, roimask.raw, roi xaml?
 
     #if have_xml and have_processed_tiff:
-    if have_xml and have_movie:
+    #if have_xml and have_movie:
+    if have_xml:
         '''
         if not have_extracted_metadata:
             warnings.warn('there does not seem to be extracted metadata in' + d)
@@ -221,6 +416,12 @@ def main():
     
     
 if __name__ == '__main__':
+    # TODO delete
+    analyze_thorimage_offline('test_dir/_001')
+    #monitor_thorimage('test_dir/_001')
+    import sys; sys.exit()
+    #
+
     # TODO make directory to watch configurable w/ config file
     main()
 
